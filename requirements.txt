@@ -1,3 +1,5 @@
 streamlit>=1.40,<2
-openai>=1.80,<3
-Markdown>=3.6,<4
+openai>=2,<3
+Pillow>=11,<13
+markdown>=3.7,<4
+tzdata>=2025.1
