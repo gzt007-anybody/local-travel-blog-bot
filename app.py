@@ -1,8 +1,9 @@
-"""로컬 여행 블로그 봇 1.3 — Streamlit + OpenAI Responses web search."""
+"""로컬 여행 블로그 봇 1.3.1 — Streamlit + OpenAI Responses web search."""
 import os
 import json
 import hashlib
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import timezone
@@ -16,9 +17,9 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="로컬 여행 블로그 봇 1.3", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="로컬 여행 블로그 봇 1.3.1", page_icon="🧭", layout="wide")
 st.markdown("""<style>.block-container{max-width:1150px;padding-top:1.8rem}h1{letter-spacing:-1px}</style>""", unsafe_allow_html=True)
-st.title("🧭 로컬 여행 블로그 봇 1.3")
+st.title("🧭 로컬 여행 블로그 봇 1.3.1")
 st.caption("숨은 장소 발굴 → 경쟁 콘텐츠 비교 → 검색형 제목 → 실제 여행에 도움이 되는 블로그")
 
 
@@ -36,6 +37,9 @@ def db():
     con = sqlite3.connect(CACHE_PATH, timeout=30)
     con.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY, created TEXT, usage TEXT, cost REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS jobs (key TEXT PRIMARY KEY, response_id TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS billed (response_id TEXT PRIMARY KEY)")
+    con.execute("CREATE TABLE IF NOT EXISTS response_results (response_id TEXT PRIMARY KEY, value TEXT)")
     try:
         with con:
             yield con
@@ -72,12 +76,38 @@ def model_rates(model):
              "gpt-6-luna": (0.1, 0.01, 0.5, 10.0)}
     return rates.get(model)
 
-def response_text(client, model, instructions, prompt, search=True, max_output_tokens=14000):
+def response_text(client, model, instructions, prompt, search=True, max_output_tokens=14000, job_scope=None):
     args = dict(model=model, instructions=instructions, input=prompt, max_output_tokens=max_output_tokens, service_tier="default")
     if search:
         args.update(tools=[{"type":"web_search"}], tool_choice="required", include=["web_search_call.action.sources"])
-    response = client.responses.create(**args)
+    args.update(background=True, store=True)
+    identity = {"scope":job_scope,"model":model} if job_scope else args
+    job_key = hashlib.sha256(json.dumps(identity,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+    with db() as con:
+        pending = con.execute('SELECT response_id FROM jobs WHERE key=?',(job_key,)).fetchone()
+    if pending:
+        if pending[0] == 'UNKNOWN':
+            raise RuntimeError('이전 요청의 접수 여부를 확인하지 못했습니다. 중복 과금을 막기 위해 재전송하지 않습니다. OpenAI 대시보드에서 요청 상태를 확인해 주세요.')
+        response = client.responses.retrieve(pending[0])
+    else:
+        # Persist BEFORE sending: an ambiguous POST failure must not trigger another paid request.
+        with db() as con:
+            con.execute('INSERT INTO jobs VALUES (?,?)',(job_key,'UNKNOWN'))
+        try:
+            response = client.responses.create(**args)
+        except Exception:
+            raise RuntimeError('요청 접수 여부/사용 비용 확인 불가. 자동 재전송을 차단했습니다. OpenAI 대시보드에서 확인하세요.')
+        with db() as con:
+            con.execute('UPDATE jobs SET response_id=? WHERE key=?',(response.id,job_key))
+    deadline = time.monotonic()+480
+    while response.status in ('queued','in_progress'):
+        if time.monotonic() >= deadline:
+            raise RuntimeError('아직 조사 중입니다. 같은 조건으로 1단계를 다시 누르면 기존 작업만 조회합니다. 새 생성 요청은 보내지 않습니다.')
+        time.sleep(3)
+        response = client.responses.retrieve(response.id)
     data = response.model_dump()
+    with db() as con:
+        con.execute('INSERT OR REPLACE INTO response_results VALUES (?,?)',(response.id,json.dumps({"text":response.output_text or "", "response":data},ensure_ascii=False)))
     usage = data.get("usage") or {}
     ins = usage.get("input_tokens",0)
     cached = (usage.get("input_tokens_details") or {}).get("cached_tokens",0)
@@ -91,7 +121,9 @@ def response_text(client, model, instructions, prompt, search=True, max_output_t
             input_rate, cached_rate, output_rate = input_rate*2, cached_rate*2, output_rate*1.5
         cost = ((ins-cached)*input_rate + cached*cached_rate + outs*output_rate)/1_000_000 + searches*search_rate/1000
     with db() as con:
-        con.execute("INSERT INTO ledger(created,usage,cost) VALUES (?,?,?)", (datetime.now(timezone.utc).isoformat(),json.dumps({**usage,"search_calls":searches,"model":model,"rates":rates,"pricing_checked":"2026-10-25"}),cost))
+        inserted = con.execute('INSERT OR IGNORE INTO billed VALUES (?)',(response.id,)).rowcount
+        if inserted:
+            con.execute("INSERT INTO ledger(created,usage,cost) VALUES (?,?,?)", (datetime.now(timezone.utc).isoformat(),json.dumps({**usage,"search_calls":searches,"model":model,"rates":rates,"pricing_checked":"2026-10-25"}),cost))
     st.session_state['last_usage'] = {"입력 토큰":ins,"캐시 입력 토큰":cached,"출력 토큰":outs,"검색 호출":searches,"이번 예상 비용 USD":cost}
     result = (response.output_text or "").strip()
     if data.get("status") != "completed" or not result:
@@ -104,6 +136,7 @@ def response_text(client, model, instructions, prompt, search=True, max_output_t
         for content in item.get("content",[]):
             sources.extend(a for a in content.get("annotations",[]) if a.get("type")=="url_citation")
     st.session_state['last_sources'] = sources
+    st.session_state['finished_job'] = job_key
     return result
 
 def research_bundle(key, refresh, generate):
@@ -116,6 +149,9 @@ def research_bundle(key, refresh, generate):
         raise ValueError("완성 본문 구분/필수 여행지 소개가 누락되었습니다. 기존 캐시는 유지됩니다. 다시 시도하면 API 비용이 발생합니다.")
     record = {"report":report.strip(),"body":body.strip(),"created":datetime.now(timezone.utc).isoformat(),"sources":st.session_state.get("last_sources",[])}
     save_cache(key,record)
+    if st.session_state.get('finished_job'):
+        with db() as con:
+            con.execute('DELETE FROM jobs WHERE key=?',(st.session_state['finished_job'],))
     return record, False
 
 
@@ -274,7 +310,7 @@ if research:
         try:
             with st.spinner("웹 자료를 확인하고 경쟁 글을 비교하고 있습니다…"):
                 prompt += "\n조사 보고서 뒤에 정확히 <!--MAIN_BODY--> 구분자를 한 번 넣고, 위 조사에 근거한 완성 블로그 원고를 작성하라. 원고는 # 추천 제목으로 시작. 사실에는 [출처 근거]와 URL, 제안에는 [여행 제안], 미확인 내용에는 [미확인]을 표시하라. 검색한 날짜와 출처 발행일을 구분하라."
-                record, hit = research_bundle(request_key, refresh, lambda: response_text(OpenAI(api_key=api_key, max_retries=0, timeout=180), model, policy+ARTICLE_RULES, prompt))
+                record, hit = research_bundle(request_key, refresh, lambda: response_text(OpenAI(api_key=api_key, max_retries=0, timeout=60), model, policy+ARTICLE_RULES, prompt, job_scope=request_key))
                 st.session_state.record = record
                 st.session_state.active_key = request_key
                 st.session_state.research = record["report"]
@@ -347,6 +383,17 @@ if st.session_state.draft:
 st.divider()
 spent = total_cost()
 st.subheader("API 사용 내역 · 누적 비용")
+with db() as con:
+    unfinished = con.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]
+if unfinished:
+    st.warning('미완료 또는 접수 여부 불명 요청이 있습니다. 아래 금액에는 아직 확인되지 않은 비용이 포함되지 않습니다. $0 표시가 무료를 의미하지 않습니다. 같은 조건으로 재실행하면 기존 작업만 조회합니다.')
+    with db() as con:
+        jobs = [dict(zip(['작업키','응답 ID'],row)) for row in con.execute('SELECT key,response_id FROM jobs')]
+    st.dataframe(jobs,hide_index=True)
+with db() as con:
+    saved_responses = [json.loads(row[0]) for row in con.execute('SELECT value FROM response_results')]
+if saved_responses:
+    st.download_button('수신한 원본 결과 백업 (본문 형식 오류 포함)',json.dumps(saved_responses,ensure_ascii=False,indent=2),'received_responses.json','application/json')
 st.metric("누적 사용 비용 (추정 USD)", f"${spent:.6f}")
 with db() as con:
     ledger_rows = [dict(zip(['id','created_utc','usage_json','estimated_usd'], row)) for row in con.execute('SELECT id,created,usage,cost FROM ledger ORDER BY id')]
