@@ -65,8 +65,15 @@ def reuse_body(body, title):
     clean_title = " ".join(title.split()).lstrip('# ').strip()
     return "# " + clean_title + "\n\n" + re.sub(r"\A\s*# [^\n]*\n*", "", body, count=1)
 
+def model_rates(model):
+    # Standard tier, short context. Official pricing checked 2026-10-25.
+    rates = {"gpt-6-astra": (10.0, 1.0, 50.0, 10.0),
+             "gpt-6.1-sol": (2.0, 0.1, 10.0, 10.0),
+             "gpt-6-luna": (0.1, 0.01, 0.5, 10.0)}
+    return rates.get(model)
+
 def response_text(client, model, instructions, prompt, search=True, max_output_tokens=14000):
-    args = dict(model=model, instructions=instructions, input=prompt, max_output_tokens=max_output_tokens)
+    args = dict(model=model, instructions=instructions, input=prompt, max_output_tokens=max_output_tokens, service_tier="default")
     if search:
         args.update(tools=[{"type":"web_search"}], tool_choice="required", include=["web_search_call.action.sources"])
     response = client.responses.create(**args)
@@ -76,9 +83,15 @@ def response_text(client, model, instructions, prompt, search=True, max_output_t
     cached = (usage.get("input_tokens_details") or {}).get("cached_tokens",0)
     outs = usage.get("output_tokens",0)
     searches = sum(o.get("type")=="web_search_call" for o in data.get("output",[]))
-    cost = ((ins-cached)*input_rate + cached*cached_rate + outs*output_rate)/1_000_000 + searches*search_rate/1000
+    rates = model_rates(model)
+    cost = None
+    if rates and data.get("usage"):
+        input_rate, cached_rate, output_rate, search_rate = rates
+        if ins > 272000:
+            input_rate, cached_rate, output_rate = input_rate*2, cached_rate*2, output_rate*1.5
+        cost = ((ins-cached)*input_rate + cached*cached_rate + outs*output_rate)/1_000_000 + searches*search_rate/1000
     with db() as con:
-        con.execute("INSERT INTO ledger(created,usage,cost) VALUES (?,?,?)", (datetime.now(timezone.utc).isoformat(),json.dumps({**usage,"search_calls":searches,"model":model,"rates":[input_rate,cached_rate,output_rate,search_rate]}),cost))
+        con.execute("INSERT INTO ledger(created,usage,cost) VALUES (?,?,?)", (datetime.now(timezone.utc).isoformat(),json.dumps({**usage,"search_calls":searches,"model":model,"rates":rates,"pricing_checked":"2026-10-25"}),cost))
     st.session_state['last_usage'] = {"입력 토큰":ins,"캐시 입력 토큰":cached,"출력 토큰":outs,"검색 호출":searches,"이번 예상 비용 USD":cost}
     result = (response.output_text or "").strip()
     if data.get("status") != "completed" or not result:
@@ -210,14 +223,6 @@ with st.sidebar:
                             help="Streamlit Cloud의 Secrets에 OPENAI_API_KEY를 등록하면 직접 입력할 필요가 없습니다.")
     model = st.text_input("API 모델", value=secret("OPENAI_MODEL", "gpt-6-astra"),
                           help="계정에서 사용 가능한 Responses API + web_search 지원 모델로 변경할 수 있습니다.")
-    st.subheader("비용 설정 · USD")
-    st.caption("공식 가격표의 해당 모델 단가를 입력하세요. 0이면 미설정이며 비용이 과소 표시됩니다.")
-    input_rate = st.number_input("입력 / 100만 토큰 USD", min_value=0.0, value=0.0, format="%.4f")
-    cached_rate = st.number_input("캐시 입력 / 100만 토큰 USD", min_value=0.0, value=0.0, format="%.4f")
-    output_rate = st.number_input("출력 / 100만 토큰 USD", min_value=0.0, value=0.0, format="%.4f")
-    search_rate = st.number_input("검색 / 1000회 USD", min_value=0.0, value=0.0, format="%.4f")
-    balance = st.number_input("시작 잔액 또는 이 앱 예산 USD", min_value=0.0, value=0.0)
-    st.caption("이 입력값은 세션 동안 유지됩니다. 앱 재시작 시 다시 입력하세요. 누적 비용 기록은 디스크에 유지됩니다.")
     st.info("웹 검색 기능에는 별도 API 사용료가 발생할 수 있습니다. 키는 코드 파일에 저장하지 마세요.")
 
 with st.form("travel_options"):
@@ -249,8 +254,6 @@ request_key = cache_key(options)
 if research:
     if not api_key and (refresh or not load_cache(request_key)):
         st.error("OpenAI API 키를 설정해 주세요. ChatGPT 구독과 API 요금은 별도입니다.")
-    elif (refresh or not load_cache(request_key)) and (not input_rate or not output_rate or not search_rate):
-        st.error("비용 계산을 위해 사이드바에 입력·출력·검색 단가를 먼저 입력해 주세요. 캐시 재사용은 단가 없이 가능합니다.")
     elif not region.strip():
         st.error("여행 지역을 입력해 주세요.")
     else:
@@ -343,16 +346,24 @@ if st.session_state.draft:
 
 st.divider()
 spent = total_cost()
-st.subheader("API 예상 비용 · 입력 단가 기준")
-if not input_rate or not output_rate or not search_rate:
-    st.warning("단가 미설정: 아래 금액은 실제 비용이 아닙니다. 과거 기록은 당시 입력 단가로 저장되며 소급 계산되지 않습니다.")
-st.write(f"이 앱 누적 추정 사용액: ${spent:.6f} · 입력 잔액 기준 추정 남은 금액: ${balance-spent:.6f}")
-if st.session_state.get("last_usage"):
-    st.caption("마지막 API 요청의 사용량 (캐시 적중 및 2단계는 추가 사용량 0)")
-    st.json(st.session_state.last_usage)
+st.subheader("API 사용 내역 · 누적 비용")
+st.metric("누적 사용 비용 (추정 USD)", f"${spent:.6f}")
 with db() as con:
     ledger_rows = [dict(zip(['id','created_utc','usage_json','estimated_usd'], row)) for row in con.execute('SELECT id,created,usage,cost FROM ledger ORDER BY id')]
-st.download_button("API 비용 장부 JSON 다운로드", json.dumps(ledger_rows, ensure_ascii=False, indent=2), "api_cost_ledger.json", "application/json")
-st.caption("계정 실잔액 자동 조회 아님. 다른 앱 사용량·세금·환율·실패 요청 중 사용량 미반환 건은 반영되지 않을 수 있습니다. 새로고침은 별도 과금됩니다.")
+if ledger_rows:
+    display_rows = []
+    for row in ledger_rows:
+        usage = json.loads(row['usage_json'])
+        display_rows.append({"호출시각 KST":datetime.fromisoformat(row['created_utc']).astimezone(ZoneInfo('Asia/Seoul')).strftime('%Y-%m-%d %H:%M:%S'),
+            "모델":usage.get('model',''), "입력 토큰":usage.get('input_tokens',0),
+            "출력 토큰":usage.get('output_tokens',0), "검색 횟수":usage.get('search_calls',0),
+            "사용 비용 USD":row['estimated_usd']})
+    st.dataframe(display_rows, hide_index=True, use_container_width=True)
+    if any(row['estimated_usd'] is None for row in ledger_rows):
+        st.caption("단가 미등록 모델 또는 사용량 미반환 건은 비용 미산정이며 누적액에서 제외됩니다.")
+else:
+    st.caption("아직 API 사용 내역이 없습니다.")
+st.download_button("API 사용 내역 다운로드", json.dumps(ledger_rows, ensure_ascii=False, indent=2), "api_cost_ledger.json", "application/json")
+st.caption("API 응답 사용량과 앱 내장 공식 단가(2026-10-25 확인)로 자동 계산한 추정액입니다. 실제 청구액과 차이가 있을 수 있습니다. 2단계 및 캐시 재사용은 API 호출 0회 · 추가 비용 $0입니다.")
 st.caption("1.3 제한: 장소 사실 검증은 웹 검색 기반으로 오류가 있을 수 있습니다. 사진 권리는 사용자가 확인합니다.  네이버 데이터랩 연령별 실측 검색량 API 연동, 실시간 숙박 예약·요금, 지도 이동시간 자동 계산, 발행 후 검색 노출 추적은 아직 구현되지 않았습니다. 모든 내용은 발행 전에 확인해 주세요.")
 
